@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -212,6 +213,19 @@ type PendingDialManager struct {
 	pendingDial map[int64]*ProxyClientConnection
 }
 
+func (pm *PendingDialManager) removeAll() []*ProxyClientConnection {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	pending := make([]*ProxyClientConnection, 0, len(pm.pendingDial))
+	for dialID, frontend := range pm.pendingDial {
+		delete(pm.pendingDial, dialID)
+		pending = append(pending, frontend)
+	}
+	metrics.Metrics.SetPendingDialCount(0)
+	return pending
+}
+
 func (pm *PendingDialManager) Add(random int64, clientConn *ProxyClientConnection) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -280,6 +294,15 @@ type ProxyServer struct {
 	xfrChannelSize  int
 
 	backendDialTimeout time.Duration
+
+	// draining is set before the frontend listener begins graceful shutdown.
+	// Existing tunnels may finish, but new frontend streams and dials are
+	// rejected and readiness reports false.
+	draining atomic.Bool
+	// frontendConnections includes both gRPC streams and hijacked HTTP CONNECT
+	// requests. net/http does not wait for hijacked connections during
+	// Shutdown, so this counter provides a common drain barrier for both modes.
+	frontendConnections atomic.Int64
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -294,6 +317,63 @@ type AgentTokenAuthenticationOptions struct {
 var _ agent.AgentServiceServer = &ProxyServer{}
 
 var _ client.ProxyServiceServer = &ProxyServer{}
+
+// SetDraining prevents new frontend work from being assigned to this server.
+func (s *ProxyServer) SetDraining() {
+	s.draining.Store(true)
+}
+
+// IsDraining reports whether graceful shutdown has started.
+func (s *ProxyServer) IsDraining() bool {
+	return s.draining.Load()
+}
+
+// Ready combines process drain state with backend readiness.
+func (s *ProxyServer) Ready() (bool, string) {
+	if s.IsDraining() {
+		return false, "proxy server is draining"
+	}
+	return s.Readiness.Ready()
+}
+
+// WaitForFrontendDrain waits until every frontend stream that was accepted
+// before drain began has completed.
+func (s *ProxyServer) WaitForFrontendDrain(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.frontendConnections.Load() == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// ForceCloseHTTPFrontends closes hijacked HTTP CONNECT connections. gRPC
+// streams are closed by grpc.Server.Stop in the frontend force-stop callback.
+func (s *ProxyServer) ForceCloseHTTPFrontends() {
+	var frontends []*ProxyClientConnection
+	s.fmu.RLock()
+	for _, established := range s.established {
+		for _, frontend := range established {
+			frontends = append(frontends, frontend)
+		}
+	}
+	s.fmu.RUnlock()
+	frontends = append(frontends, s.PendingDial.removeAll()...)
+
+	for _, frontend := range frontends {
+		if frontend.Mode == ModeHTTPConnect && frontend.CloseHTTP != nil {
+			if err := frontend.CloseHTTP(); err != nil {
+				klog.ErrorS(err, "failed to force close HTTP frontend", "dialID", frontend.dialID)
+			}
+		}
+	}
+}
 
 func genContext(proxyStrategies []proxystrategies.ProxyStrategy, reqHost string) context.Context {
 	ctx := context.Background()
@@ -541,6 +621,11 @@ func (s *ProxyServer) SetBackendDialTimeout(timeout time.Duration) {
 func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	metrics.Metrics.ConnectionInc(metrics.Proxy)
 	defer metrics.Metrics.ConnectionDec(metrics.Proxy)
+	s.frontendConnections.Add(1)
+	defer s.frontendConnections.Add(-1)
+	if s.IsDraining() {
+		return status.Error(codes.Unavailable, "proxy server is draining")
+	}
 
 	md, ok := metadata.FromIncomingContext(stream.Context())
 	if !ok {
@@ -654,6 +739,19 @@ func (s *ProxyServer) serveRecvFrontend(frontend *GrpcFrontend, recvCh <-chan *c
 			random := pkt.GetDialRequest().Random
 			address := pkt.GetDialRequest().Address
 			klog.V(3).InfoS("Received DIAL_REQ", "dialID", random, "dialAddress", address)
+			if s.IsDraining() {
+				err := status.Error(codes.Unavailable, "proxy server is draining")
+				resp := &client.Packet{
+					Type: client.PacketType_DIAL_RSP,
+					Payload: &client.Packet_DialResponse{
+						DialResponse: &client.DialResponse{Random: random, Error: err.Error()},
+					},
+				}
+				if sendErr := frontend.Send(resp); sendErr != nil {
+					klog.V(5).InfoS("Failed to send DIAL_RSP for draining server", "error", sendErr, "dialID", random)
+				}
+				return
+			}
 			// TODO: if we track what agent has historically served
 			// the address, then we can send the Dial_REQ to the
 			// same agent. That way we save the agent from creating

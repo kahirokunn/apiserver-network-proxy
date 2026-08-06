@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -358,11 +359,17 @@ func TestDrain(t *testing.T) {
 		stopCh:      stopCh,
 		cs:          cs,
 	}
-	testClient.stream, stream = pipe()
+	agentStream, stream := pipe()
+	testClient.stream = agentStream
+	recvStarted := make(chan struct{})
+	agentStream.(*fakeStream).recvStarted = recvStarted
 
 	// Start agent
 	go testClient.Serve()
 	defer close(stopCh)
+
+	// Ensure Serve is blocked in Recv before requesting drain.
+	<-recvStarted
 
 	// Simulate pod first shutdown signal
 	close(drainCh)
@@ -380,8 +387,10 @@ func TestDrain(t *testing.T) {
 // fakeStream implements AgentService_ConnectClient
 type fakeStream struct {
 	grpc.ClientStream
-	r <-chan *client.Packet
-	w chan<- *client.Packet
+	r               <-chan *client.Packet
+	w               chan<- *client.Packet
+	recvStarted     chan struct{}
+	recvStartedOnce sync.Once
 }
 
 func pipe() (agent.AgentService_ConnectClient, agent.AgentService_ConnectClient) {
@@ -399,6 +408,11 @@ func (s *fakeStream) Send(packet *client.Packet) error {
 }
 
 func (s *fakeStream) Recv() (*client.Packet, error) {
+	if s.recvStarted != nil {
+		s.recvStartedOnce.Do(func() {
+			close(s.recvStarted)
+		})
+	}
 	select {
 	case pkt := <-s.r:
 		klog.V(4).InfoS("[DEBUG] recv", "packet", pkt)

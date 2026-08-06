@@ -17,8 +17,23 @@ limitations under the License.
 package agent
 
 import (
+	"reflect"
 	"testing"
 )
+
+func TestConnectedServerIDs(t *testing.T) {
+	cs := &ClientSet{clients: map[string]*Client{
+		"server-c": nil,
+		"server-a": nil,
+		"server-b": nil,
+	}}
+
+	got := cs.ConnectedServerIDs()
+	want := []string{"server-a", "server-b", "server-c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ConnectedServerIDs() = %v, want %v", got, want)
+	}
+}
 
 type FakeServerCounter struct {
 	count int

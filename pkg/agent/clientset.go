@@ -20,6 +20,7 @@ import (
 	"context"
 	"math"
 	runpprof "runtime/pprof"
+	"sort"
 	"sync"
 	"time"
 
@@ -100,6 +101,21 @@ func (cs *ClientSet) ClientsCount() int {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	return len(cs.clients)
+}
+
+// ConnectedServerIDs returns a stable snapshot of the proxy server IDs to which this
+// agent is connected. The sorted result is suitable for health controllers to
+// compare with the desired membership set without reaching into ClientSet.
+func (cs *ClientSet) ConnectedServerIDs() []string {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	ids := make([]string, 0, len(cs.clients))
+	for serverID := range cs.clients {
+		ids = append(ids, serverID)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // SetServerCounter sets the strategy for determining the server count.

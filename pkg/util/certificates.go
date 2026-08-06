@@ -17,11 +17,16 @@ limitations under the License.
 package util //nolint:revive
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
+
+	"google.golang.org/grpc/credentials"
 )
 
 // getCACertPool loads CA certificates to pool
@@ -64,5 +69,75 @@ func GetClientTLSConfig(caFile, certFile, keyFile, serverName string, protos []s
 
 	tlsConfig.ServerName = serverName
 	tlsConfig.Certificates = []tls.Certificate{cert}
+	tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to reload X509 key pair %s and %s: %v", certFile, keyFile, err)
+		}
+		return &certificate, nil
+	}
 	return tlsConfig, nil
+}
+
+// GetReloadingClientTLSCredentials validates the configured files at startup
+// and returns client-only transport credentials that reload the CA and client
+// key pair for every new connection. Existing connections continue normally;
+// a reconnect after projected Secret rotation always uses the new material.
+func GetReloadingClientTLSCredentials(caFile, certFile, keyFile, serverName string, protos []string) (credentials.TransportCredentials, error) {
+	if _, err := GetClientTLSConfig(caFile, certFile, keyFile, serverName, protos); err != nil {
+		return nil, err
+	}
+	return &reloadingClientTLSCredentials{
+		caFile: caFile, certFile: certFile, keyFile: keyFile,
+		serverName: serverName, protos: append([]string(nil), protos...),
+	}, nil
+}
+
+type reloadingClientTLSCredentials struct {
+	caFile     string
+	certFile   string
+	keyFile    string
+	protos     []string
+	mu         sync.RWMutex
+	serverName string
+}
+
+func (c *reloadingClientTLSCredentials) ClientHandshake(ctx context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	c.mu.RLock()
+	serverName := c.serverName
+	protos := append([]string(nil), c.protos...)
+	c.mu.RUnlock()
+	tlsConfig, err := GetClientTLSConfig(c.caFile, c.certFile, c.keyFile, serverName, protos)
+	if err != nil {
+		_ = rawConn.Close()
+		return nil, nil, fmt.Errorf("reload client TLS credentials: %w", err)
+	}
+	return credentials.NewTLS(tlsConfig).ClientHandshake(ctx, authority, rawConn)
+}
+
+func (*reloadingClientTLSCredentials) ServerHandshake(rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	_ = rawConn.Close()
+	return nil, nil, fmt.Errorf("reloading client TLS credentials cannot perform a server handshake")
+}
+
+func (c *reloadingClientTLSCredentials) Info() credentials.ProtocolInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return credentials.ProtocolInfo{SecurityProtocol: "tls", SecurityVersion: "1.2", ServerName: c.serverName}
+}
+
+func (c *reloadingClientTLSCredentials) Clone() credentials.TransportCredentials {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return &reloadingClientTLSCredentials{
+		caFile: c.caFile, certFile: c.certFile, keyFile: c.keyFile,
+		serverName: c.serverName, protos: append([]string(nil), c.protos...),
+	}
+}
+
+func (c *reloadingClientTLSCredentials) OverrideServerName(serverName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.serverName = serverName
+	return nil
 }
