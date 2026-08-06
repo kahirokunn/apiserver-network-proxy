@@ -24,10 +24,11 @@ type ReadinessManager interface {
 }
 
 var _ ReadinessManager = &DefaultBackendStorage{}
+var _ ReadinessManager = &ProxyServer{}
 
 func (s *DefaultBackendStorage) Ready() (bool, string) {
-	if s.NumBackends() == 0 {
-		return false, "no connection to any proxy agent"
+	if s.NumReadyBackends() == 0 {
+		return false, "no non-draining connection to any proxy agent"
 	}
 	return true, ""
 }

@@ -24,6 +24,7 @@ import (
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc/metadata"
 
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 	agentmock "sigs.k8s.io/apiserver-network-proxy/proto/agent/mocks"
 )
 
@@ -384,7 +385,7 @@ func TestDestHostBackendManager_WithDuplicateIdents(t *testing.T) {
 	}
 }
 
-func TestDefaultBackendManager_GetRandomBackend_DrainingFallback(t *testing.T) {
+func TestDefaultBackendManager_DoesNotSelectDrainingBackends(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -428,23 +429,21 @@ func TestDefaultBackendManager_GetRandomBackend_DrainingFallback(t *testing.T) {
 		}
 	}
 
-	// Test 4: When all backends are draining, fallback to a draining backend
+	// Test 4: When all backends are draining, no backend is available.
 	backend2.SetDraining()
 	backend3.SetDraining()
 
-	b, err = p.Backend(context.Background())
-	if err != nil {
-		t.Errorf("expected fallback to draining backend, got error: %v", err)
+	if _, err = p.Backend(context.Background()); err == nil {
+		t.Fatal("expected ErrNotFound when all backends are draining")
+	} else if _, ok := err.(*ErrNotFound); !ok {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
-	if b == nil {
-		t.Error("expected a backend, got nil")
-	}
-	if !b.IsDraining() {
-		t.Error("expected draining backend as fallback")
+	if ready, _ := p.Ready(); ready {
+		t.Fatal("expected manager with only draining backends to be unready")
 	}
 }
 
-func TestDestHostBackendManager_Backend_DrainingFallback(t *testing.T) {
+func TestDestHostBackendManager_DoesNotSelectDrainingBackends(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -481,22 +480,13 @@ func TestDestHostBackendManager_Backend_DrainingFallback(t *testing.T) {
 		t.Errorf("expected backend2 (non-draining), got different backend")
 	}
 
-	// Test 3: When all backends for destHost are draining, fallback to a draining backend
+	// Test 3: When all backends for destHost are draining, no backend is available.
 	backend2.SetDraining()
 
-	b, err = p.Backend(ctx)
-	if err != nil {
-		t.Errorf("expected fallback to draining backend, got error: %v", err)
-	}
-	if b == nil {
-		t.Error("expected a backend, got nil")
-	}
-	if !b.IsDraining() {
-		t.Error("expected draining backend as fallback")
-	}
-	// Verify we got one of the localhost backends, not otherhost
-	if b != backend1 && b != backend2 {
-		t.Error("expected fallback to be one of the localhost backends")
+	if _, err = p.Backend(ctx); err == nil {
+		t.Fatal("expected ErrNotFound when all destination backends are draining")
+	} else if _, ok := err.(*ErrNotFound); !ok {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 
 	// Test 4: Different destHost still works independently
@@ -510,5 +500,30 @@ func TestDestHostBackendManager_Backend_DrainingFallback(t *testing.T) {
 	}
 	if b.IsDraining() {
 		t.Error("expected non-draining backend for otherhost")
+	}
+}
+
+func TestProxyServerReadinessIncludesDrainState(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	proxyServer := NewProxyServer("server-1", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, 1)
+	backend, err := NewBackend(mockAgentConn(ctrl, "agent-1", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyServer.addBackend(backend)
+	if ready, message := proxyServer.Ready(); !ready {
+		t.Fatalf("Ready() = false, %q; want ready with a non-draining backend", message)
+	}
+
+	backend.SetDraining()
+	if ready, _ := proxyServer.Ready(); ready {
+		t.Fatal("Ready() = true; want false when the only backend is draining")
+	}
+
+	proxyServer.SetDraining()
+	if ready, message := proxyServer.Ready(); ready || message != "proxy server is draining" {
+		t.Fatalf("Ready() = %v, %q; want false, draining message", ready, message)
 	}
 }

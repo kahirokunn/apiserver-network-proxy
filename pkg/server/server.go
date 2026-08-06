@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,6 +36,7 @@ import (
 	"google.golang.org/grpc/status"
 	authv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
@@ -212,6 +214,19 @@ type PendingDialManager struct {
 	pendingDial map[int64]*ProxyClientConnection
 }
 
+func (pm *PendingDialManager) removeAll() []*ProxyClientConnection {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	pending := make([]*ProxyClientConnection, 0, len(pm.pendingDial))
+	for dialID, frontend := range pm.pendingDial {
+		delete(pm.pendingDial, dialID)
+		pending = append(pending, frontend)
+	}
+	metrics.Metrics.SetPendingDialCount(0)
+	return pending
+}
+
 func (pm *PendingDialManager) Add(random int64, clientConn *ProxyClientConnection) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -280,6 +295,15 @@ type ProxyServer struct {
 	xfrChannelSize  int
 
 	backendDialTimeout time.Duration
+
+	// draining is set before the frontend listener begins graceful shutdown.
+	// Existing tunnels may finish, but new frontend streams and dials are
+	// rejected and readiness reports false.
+	draining atomic.Bool
+	// frontendConnections includes both gRPC streams and hijacked HTTP CONNECT
+	// requests. net/http does not wait for hijacked connections during
+	// Shutdown, so this counter provides a common drain barrier for both modes.
+	frontendConnections atomic.Int64
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -295,6 +319,54 @@ var _ agent.AgentServiceServer = &ProxyServer{}
 
 var _ client.ProxyServiceServer = &ProxyServer{}
 
+// SetDraining prevents new frontend work from being assigned to this server.
+func (s *ProxyServer) SetDraining() {
+	s.draining.Store(true)
+}
+
+// IsDraining reports whether graceful shutdown has started.
+func (s *ProxyServer) IsDraining() bool {
+	return s.draining.Load()
+}
+
+// Ready combines process drain state with backend readiness.
+func (s *ProxyServer) Ready() (bool, string) {
+	if s.IsDraining() {
+		return false, "proxy server is draining"
+	}
+	return s.Readiness.Ready()
+}
+
+// WaitForFrontendDrain waits until every frontend stream that was accepted
+// before drain began has completed.
+func (s *ProxyServer) WaitForFrontendDrain(ctx context.Context) error {
+	return wait.PollUntilContextCancel(ctx, 10*time.Millisecond, true, func(context.Context) (bool, error) {
+		return s.frontendConnections.Load() == 0, nil
+	})
+}
+
+// ForceCloseHTTPFrontends closes hijacked HTTP CONNECT connections. gRPC
+// streams are closed by grpc.Server.Stop in the frontend force-stop callback.
+func (s *ProxyServer) ForceCloseHTTPFrontends() {
+	var frontends []*ProxyClientConnection
+	s.fmu.RLock()
+	for _, established := range s.established {
+		for _, frontend := range established {
+			frontends = append(frontends, frontend)
+		}
+	}
+	s.fmu.RUnlock()
+	frontends = append(frontends, s.PendingDial.removeAll()...)
+
+	for _, frontend := range frontends {
+		if frontend.Mode == ModeHTTPConnect && frontend.CloseHTTP != nil {
+			if err := frontend.CloseHTTP(); err != nil {
+				klog.ErrorS(err, "failed to force close HTTP frontend", "dialID", frontend.dialID)
+			}
+		}
+	}
+}
+
 func genContext(proxyStrategies []proxystrategies.ProxyStrategy, reqHost string) context.Context {
 	ctx := context.Background()
 	for _, ps := range proxyStrategies {
@@ -308,6 +380,9 @@ func genContext(proxyStrategies []proxystrategies.ProxyStrategy, reqHost string)
 }
 
 func (s *ProxyServer) getBackend(reqHost string) (*Backend, error) {
+	if s.IsDraining() {
+		return nil, fmt.Errorf("proxy server is draining")
+	}
 	ctx := genContext(s.proxyStrategies, reqHost)
 	for _, bm := range s.BackendManagers {
 		be, err := bm.Backend(ctx)
@@ -541,6 +616,11 @@ func (s *ProxyServer) SetBackendDialTimeout(timeout time.Duration) {
 func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	metrics.Metrics.ConnectionInc(metrics.Proxy)
 	defer metrics.Metrics.ConnectionDec(metrics.Proxy)
+	s.frontendConnections.Add(1)
+	defer s.frontendConnections.Add(-1)
+	if s.IsDraining() {
+		return status.Error(codes.Unavailable, "proxy server is draining")
+	}
 
 	md, ok := metadata.FromIncomingContext(stream.Context())
 	if !ok {

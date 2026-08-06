@@ -338,24 +338,12 @@ func (a *Client) Serve() {
 
 	klog.V(2).InfoS("Start serving", "serverID", a.serverID, "agentID", a.agentID)
 	go a.probe()
+	go a.sendDrainWhenRequested()
 	for {
 		select {
 		case <-a.stopCh:
 			klog.V(2).InfoS("stop agent client.")
 			return
-		case <-a.drainCh:
-			a.drainOnce.Do(func() {
-				klog.V(2).InfoS("drain agent client", "serverID", a.serverID, "agentID", a.agentID)
-				drainPkt := &client.Packet{
-					Type: client.PacketType_DRAIN,
-					Payload: &client.Packet_Drain{
-						Drain: &client.Drain{},
-					},
-				}
-				if err := a.Send(drainPkt); err != nil {
-					klog.ErrorS(err, "drain failure", "")
-				}
-			})
 		default:
 		}
 
@@ -574,6 +562,28 @@ func (a *Client) Serve() {
 			klog.V(5).InfoS("unrecognized packet", "type", pkt)
 		}
 	}
+}
+
+// sendDrainWhenRequested sends DRAIN independently of the receive loop, which
+// can block indefinitely on an idle stream.
+func (a *Client) sendDrainWhenRequested() {
+	select {
+	case <-a.stopCh:
+		return
+	case <-a.drainCh:
+	}
+	a.drainOnce.Do(func() {
+		klog.V(2).InfoS("drain agent client", "serverID", a.serverID, "agentID", a.agentID)
+		drainPkt := &client.Packet{
+			Type: client.PacketType_DRAIN,
+			Payload: &client.Packet_Drain{
+				Drain: &client.Drain{},
+			},
+		}
+		if err := a.Send(drainPkt); err != nil {
+			klog.ErrorS(err, "drain failure", "")
+		}
+	})
 }
 
 func (a *Client) remoteToSendChannel(connID int64, eConn *endpointConn) {

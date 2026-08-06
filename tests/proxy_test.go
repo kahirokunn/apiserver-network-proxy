@@ -789,7 +789,7 @@ func TestFailedDial_HTTPCONN(t *testing.T) {
 	resetAllMetrics() // For clean shutdown.
 }
 
-func TestProxyHandle_AfterDrain(t *testing.T) {
+func TestProxyHandle_AfterDrainRejectsNewRequest(t *testing.T) {
 	expectCleanShutdown(t)
 
 	server := httptest.NewServer(newEchoServer("hello"))
@@ -804,6 +804,11 @@ func TestProxyHandle_AfterDrain(t *testing.T) {
 
 	// Drain agent
 	a.Drain()
+	if err := wait.PollImmediate(10*time.Millisecond, framework.ForeverTestTimeout, func() (bool, error) {
+		return !ps.Ready(), nil
+	}); err != nil {
+		t.Fatal("proxy server remained ready after its only agent began draining")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -824,18 +829,21 @@ func TestProxyHandle_AfterDrain(t *testing.T) {
 	}
 
 	r, err := c.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		r.Body.Close()
+		t.Fatal("expected a new request to be rejected after the only agent began draining")
 	}
-	defer r.Body.Close()
+	if !strings.Contains(err.Error(), "No agent available") {
+		t.Fatalf("expected no-agent error after drain, got: %v", err)
+	}
 
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		t.Fatal(err)
+	if err := clientmetricstest.ExpectClientDialFailure(metricsclient.DialFailureEndpoint, 1); err != nil {
+		t.Error(err)
 	}
-	if string(data) != "hello" {
-		t.Errorf("expect %v; got %v", "hello", string(data))
+	if err := ps.Metrics().ExpectServerDialFailure(metricsserver.DialFailureNoAgent, 1); err != nil {
+		t.Error(err)
 	}
+	resetAllMetrics() // For clean shutdown.
 }
 
 func runGRPCProxyServer(t testing.TB) framework.ProxyServer {

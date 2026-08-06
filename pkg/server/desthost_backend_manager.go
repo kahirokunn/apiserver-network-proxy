@@ -77,27 +77,9 @@ func (dibm *DestHostBackendManager) Backend(ctx context.Context) (*Backend, erro
 	}
 	destHost := ctx.Value(destHostKey).(string)
 	if destHost != "" {
-		bes, exist := dibm.backends[destHost]
-		if exist && len(bes) > 0 {
-			var firstDrainingBackend *Backend
-
-			// Find a non-draining backend for this destination host
-			for _, backend := range bes {
-				if !backend.IsDraining() {
-					klog.V(5).InfoS("Get the backend through the DestHostBackendManager", "destHost", destHost)
-					return backend, nil
-				}
-				// Keep track of first draining backend as fallback
-				if firstDrainingBackend == nil {
-					firstDrainingBackend = backend
-				}
-			}
-
-			// All backends for this destination are draining, use one as fallback
-			if firstDrainingBackend != nil {
-				klog.V(3).InfoS("All backends for destination host are draining, using one as fallback", "destHost", destHost)
-				return firstDrainingBackend, nil
-			}
+		if backend := firstNonDraining(dibm.backends[destHost]); backend != nil {
+			klog.V(5).InfoS("Get the backend through the DestHostBackendManager", "destHost", destHost)
+			return backend, nil
 		}
 	}
 	return nil, &ErrNotFound{}

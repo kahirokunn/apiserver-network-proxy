@@ -19,7 +19,7 @@ package app
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -36,7 +36,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
@@ -129,13 +128,12 @@ func handleSignals(signalCh chan os.Signal, drainCh, stopCh chan struct{}) {
 }
 
 func (a *Agent) runProxyConnection(o *options.GrpcProxyAgentOptions, drainCh, stopCh <-chan struct{}) (*agent.ClientSet, error) {
-	var tlsConfig *tls.Config
-	var err error
-	if tlsConfig, err = util.GetClientTLSConfig(o.CaCert, o.AgentCert, o.AgentKey, o.ProxyServerHost, o.AlpnProtos); err != nil {
+	tlsCredentials, err := util.GetReloadingClientTLSCredentials(o.CaCert, o.AgentCert, o.AgentKey, o.ProxyServerHost, o.AlpnProtos)
+	if err != nil {
 		return nil, err
 	}
 	dialOptions := []grpc.DialOption{
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+		grpc.WithTransportCredentials(tlsCredentials),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                o.KeepaliveTime,
 			PermitWithoutStream: true,
@@ -257,6 +255,7 @@ func (a *Agent) serveHealth(healthServer *http.Server) {
 
 func (a *Agent) runAdminServer(o *options.GrpcProxyAgentOptions) error {
 	muxHandler := http.NewServeMux()
+	muxHandler.HandleFunc("/serverz", serverIDsHandler(a.cs))
 	muxHandler.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host, _, err := net.SplitHostPort(r.Host)
 		// The port number may be omitted if the admin server is running on port
@@ -293,6 +292,19 @@ func (a *Agent) runAdminServer(o *options.GrpcProxyAgentOptions) error {
 	go runpprof.Do(context.Background(), labels, func(context.Context) { a.serveAdmin(a.adminServer) })
 
 	return nil
+}
+
+func serverIDsHandler(cs *agent.ClientSet) http.HandlerFunc {
+	type response struct {
+		ServerIDs []string `json:"connectedServerIDs"`
+	}
+
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response{ServerIDs: cs.ConnectedServerIDs()}); err != nil {
+			klog.ErrorS(err, "failed to encode connected server IDs")
+		}
+	}
 }
 
 func (a *Agent) serveAdmin(adminServer *http.Server) {

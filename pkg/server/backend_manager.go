@@ -343,6 +343,33 @@ func (s *DefaultBackendStorage) NumBackends() int {
 	return len(s.backends)
 }
 
+// NumReadyBackends returns the number of agent identifiers that have at least
+// one non-draining backend.
+func (s *DefaultBackendStorage) NumReadyBackends() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ready := 0
+	for _, backends := range s.backends {
+		if firstNonDraining(backends) != nil {
+			ready++
+		}
+	}
+	return ready
+}
+
+// firstNonDraining returns the first backend in the list that is not draining,
+// or nil if there is none. Draining connections remain in storage so existing
+// tunnels can finish, but they must not receive new work.
+func firstNonDraining(backends []*Backend) *Backend {
+	for _, backend := range backends {
+		if !backend.IsDraining() {
+			return backend
+		}
+	}
+	return nil
+}
+
 // ErrNotFound indicates that no backend can be found.
 type ErrNotFound struct{}
 
@@ -375,34 +402,16 @@ func (s *DefaultBackendStorage) GetRandomBackend() (*Backend, error) {
 		return nil, &ErrNotFound{}
 	}
 
-	var firstDrainingBackend *Backend
-
 	// Start at a random agent and check each agent in sequence
 	startIdx := s.random.Intn(len(s.agentIDs))
 	for i := 0; i < len(s.agentIDs); i++ {
 		// Wrap around using modulo
 		currentIdx := (startIdx + i) % len(s.agentIDs)
 		agentID := s.agentIDs[currentIdx]
-		// always return the first connection to an agent, because the agent
-		// will close later connections if there are multiple.
-		backend := s.backends[agentID][0]
-
-		if !backend.IsDraining() {
+		if backend := firstNonDraining(s.backends[agentID]); backend != nil {
 			klog.V(3).InfoS("Pick agent as backend", "agentID", agentID)
 			return backend, nil
 		}
-
-		// Keep track of first draining backend as fallback
-		if firstDrainingBackend == nil {
-			firstDrainingBackend = backend
-		}
-	}
-
-	// All agents are draining, use one as fallback
-	if firstDrainingBackend != nil {
-		agentID := firstDrainingBackend.id
-		klog.V(3).InfoS("No non-draining backends available, using draining backend as fallback", "agentID", agentID)
-		return firstDrainingBackend, nil
 	}
 
 	return nil, &ErrNotFound{}

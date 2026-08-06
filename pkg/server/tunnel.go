@@ -55,6 +55,8 @@ type Tunnel struct {
 func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metrics.Metrics.HTTPConnectionInc()
 	defer metrics.Metrics.HTTPConnectionDec()
+	t.Server.frontendConnections.Add(1)
+	defer t.Server.frontendConnections.Add(-1)
 
 	klog.V(2).InfoS("Received request for host", "method", r.Method, "host", r.Host, "userAgent", r.UserAgent())
 	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
@@ -62,6 +64,10 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodConnect {
 		http.Error(w, "this proxy only supports CONNECT passthrough", http.StatusMethodNotAllowed)
+		return
+	}
+	if t.Server.IsDraining() {
+		http.Error(w, "proxy server is draining", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -77,8 +83,15 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	closed := make(chan struct{})
 	var closeOnce sync.Once
-	defer closeOnce.Do(func() { conn.Close() })
+	closeConn := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+			close(closed)
+		})
+	}
+	defer closeConn()
 
 	random := rand.Int63() /* #nosec G404 */
 	dialRequest := &client.Packet{
@@ -100,14 +113,12 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The hijacked connection will be closed by the closeOnce defer.
 		return
 	}
-	closed := make(chan struct{})
 	connected := make(chan struct{})
 	connection := &ProxyClientConnection{
 		Mode: ModeHTTPConnect,
 		HTTP: io.ReadWriter(conn), // pass as ReadWriter so the caller must close with CloseHTTP
 		CloseHTTP: func() error {
-			closeOnce.Do(func() { conn.Close() })
-			close(closed)
+			closeConn()
 			return nil
 		},
 		connected: connected,

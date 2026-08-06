@@ -18,8 +18,10 @@ package agent
 
 import (
 	"context"
+	"maps"
 	"math"
 	runpprof "runtime/pprof"
+	"slices"
 	"sync"
 	"time"
 
@@ -100,6 +102,14 @@ func (cs *ClientSet) ClientsCount() int {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	return len(cs.clients)
+}
+
+// ConnectedServerIDs returns a sorted list of the proxy server IDs this agent
+// is connected to.
+func (cs *ClientSet) ConnectedServerIDs() []string {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return slices.Sorted(maps.Keys(cs.clients))
 }
 
 // SetServerCounter sets the strategy for determining the server count.
