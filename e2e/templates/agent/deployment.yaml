@@ -22,7 +22,9 @@ spec:
           requests:
             cpu: 50m
           limits:
-            memory: 30Mi
+            # 30Mi OOMs the agent once it reloads TLS material (observed in the
+            # TLS rotation test).
+            memory: 64Mi
         command: [ "/proxy-agent"]
         args: [
           {{ range .Args }}
@@ -62,6 +64,11 @@ spec:
             readOnly: true
           - mountPath: /var/run/secrets/tokens
             name: konnectivity-agent-token
+          {{- range .SecretVolumes }}
+          - name: {{ .Name }}
+            mountPath: {{ .MountPath }}
+            readOnly: true
+          {{- end }}
         ports:
         - name: serverport
           containerPort: 8090
@@ -85,4 +92,9 @@ spec:
           - serviceAccountToken:
               path: konnectivity-agent-token
               audience: system:konnectivity-server
+      {{- range .SecretVolumes }}
+      - name: {{ .Name }}
+        secret:
+          secretName: {{ .SecretName }}
+      {{- end }}
       serviceAccountName: konnectivity-agent
