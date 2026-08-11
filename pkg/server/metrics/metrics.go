@@ -25,6 +25,7 @@ import (
 	commonmetrics "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 )
 
 const (
@@ -35,6 +36,11 @@ const (
 	Proxy = "Proxy"
 	// Connect is the AgentService method used to establish next hop.
 	Connect = "Connect"
+
+	// TLSPurposeFrontend labels TLS reload metrics of the frontend listener.
+	TLSPurposeFrontend = "frontend"
+	// TLSPurposeCluster labels TLS reload metrics of the agent listener.
+	TLSPurposeCluster = "cluster"
 )
 
 var (
@@ -64,6 +70,8 @@ type ServerMetrics struct {
 	leaseDeletes         *prometheus.CounterVec
 	leaseListLatencies   *prometheus.HistogramVec
 	leaseLists           *prometheus.CounterVec
+	tlsReloadFailures    *prometheus.CounterVec
+	tlsReloadLastSuccess *prometheus.GaugeVec
 }
 
 // newServerMetrics create a new ServerMetrics, configured with default metric names.
@@ -209,8 +217,28 @@ func newServerMetrics() *ServerMetrics {
 		},
 		[]string{"http_status_code", "reason"},
 	)
+	tlsReloadFailures := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "tls_certificate_reload_failure_total",
+			Help:      "Count of failed TLS certificate reload attempts, labeled by the purpose (frontend or cluster) the certificates are configured for.",
+		},
+		[]string{"purpose"},
+	)
+	tlsReloadLastSuccess := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "tls_certificate_last_reload_success_timestamp_seconds",
+			Help:      "Unix timestamp of the last TLS certificate reload attempt that confirmed valid files, including attempts that found them unchanged. Labeled by the purpose (frontend or cluster) the certificates are configured for.",
+		},
+		[]string{"purpose"},
+	)
 	streamPackets := commonmetrics.MakeStreamPacketsTotalMetric(Namespace, Subsystem)
 	streamErrors := commonmetrics.MakeStreamErrorsTotalMetric(Namespace, Subsystem)
+	prometheus.MustRegister(tlsReloadFailures)
+	prometheus.MustRegister(tlsReloadLastSuccess)
 	prometheus.MustRegister(endpointLatencies)
 	prometheus.MustRegister(frontendLatencies)
 	prometheus.MustRegister(grpcConnections)
@@ -246,6 +274,8 @@ func newServerMetrics() *ServerMetrics {
 		leaseDeletes:         leaseDeletes,
 		leaseListLatencies:   leaseListLatencies,
 		leaseLists:           leaseLists,
+		tlsReloadFailures:    tlsReloadFailures,
+		tlsReloadLastSuccess: tlsReloadLastSuccess,
 	}
 }
 
@@ -262,6 +292,22 @@ func (s *ServerMetrics) Reset() {
 	s.dialFailures.Reset()
 	s.streamPackets.Reset()
 	s.streamErrors.Reset()
+	s.tlsReloadFailures.Reset()
+	s.tlsReloadLastSuccess.Reset()
+}
+
+// TLSReloadHooks returns reload callbacks that record the TLS certificate
+// reload metrics of the given purpose.
+func (s *ServerMetrics) TLSReloadHooks(purpose string) util.TLSReloadHooks {
+	// Create the series eagerly so they exist from startup. The callbacks
+	// resolve the labels on every call so that they keep recording after a
+	// Reset of the underlying vectors.
+	s.tlsReloadFailures.WithLabelValues(purpose)
+	s.tlsReloadLastSuccess.WithLabelValues(purpose)
+	return util.TLSReloadHooks{
+		OnSuccess: func() { s.tlsReloadLastSuccess.WithLabelValues(purpose).SetToCurrentTime() },
+		OnFailure: func() { s.tlsReloadFailures.WithLabelValues(purpose).Inc() },
+	}
 }
 
 // CulledLeasesInc increments the number of leases that the GC controller has culled.

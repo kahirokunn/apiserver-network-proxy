@@ -92,6 +92,30 @@ make build
 make docker-build
 ```
 
+## Certificate rotation
+
+The proxy server and agent always watch their configured TLS files and reload them without a restart.
+The certificate, private key and CA bundle are validated together and applied as one update. Existing
+connections continue with the material used for their handshake, and new connections use the latest
+valid material. If any file of an update is incomplete or invalid, the last valid material remains
+active and the reload is retried automatically.
+
+CA bundles are validated at startup and on reload; a certificate block that parses as PEM but not as
+a certificate rejects the entire candidate instead of applying a partially parsed trust bundle. Data
+that does not form a valid PEM block is skipped by the parser, matching kube-apiserver's dynamic CA
+reload.
+
+Rotate a CA in stages: first add the new CA to the trust bundle, then rotate the certificate and key,
+and finally remove the old CA after every peer has moved to the new identity. The
+`konnectivity_network_proxy_{server,agent}_tls_certificate_reload_failure_total` counters and the
+`konnectivity_network_proxy_{server,agent}_tls_certificate_last_reload_success_timestamp_seconds`
+gauges report reload health on the metrics endpoints of both the server and the agent; confirm each
+stage has been applied before starting the next one.
+
+Replacing the certificate and key files non-atomically briefly leaves a mismatched pair on disk, so a
+reload attempt in that window fails, counts as a failure, and is retried until both files land. Alert
+on a stale last-reload-success timestamp rather than on individual failures.
+
 ## Examples
 
 The current examples run two actual services as well as a sample client on one end and a sample destination for

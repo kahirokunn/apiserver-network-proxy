@@ -39,12 +39,12 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/apiserver-network-proxy/cmd/server/app/options"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/leases"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
@@ -147,7 +147,7 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	}
 
 	klog.V(1).Infoln("Starting agent server for tunnel connections.")
-	err = p.runAgentServer(o, p.server)
+	err = p.runAgentServer(ctx, o, p.server)
 	if err != nil {
 		return fmt.Errorf("failed to run the agent server: %v", err)
 	}
@@ -404,45 +404,29 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 	return stop, nil
 }
 
-func (p *Proxy) getTLSConfig(caFile, certFile, keyFile string, cipherSuites []string, tlsMinVersion string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load X509 key pair %s and %s: %v", certFile, keyFile, err)
-	}
-
-	cipherSuiteIDs := tlsCipherSuites(cipherSuites)
-
+func (p *Proxy) getTLSConfig(ctx context.Context, caFile, certFile, keyFile, purpose string, nextProtos, cipherSuites []string, tlsMinVersion string) (*tls.Config, error) {
 	minVersion, err := util.GetTLSVersion(tlsMinVersion)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse TLS min version: %v", err)
+		return nil, fmt.Errorf("failed to parse TLS min version: %w", err)
 	}
 
-	if caFile == "" {
-		return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: minVersion, CipherSuites: cipherSuiteIDs}, nil // #nosec G402
-	}
-
-	certPool, err := certutil.NewPool(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load cluster CA cert %s: %w", caFile, err)
-	}
-
-	tlsConfig := &tls.Config{ // #nosec G402
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		Certificates: []tls.Certificate{cert},
-		ClientCAs:    certPool,
-		MinVersion:   minVersion,
-		CipherSuites: cipherSuiteIDs,
-	}
-
-	return tlsConfig, nil
+	return util.GetReloadingServerTLSConfig(ctx, caFile, certFile, keyFile, nextProtos, tlsCipherSuites(cipherSuites), minVersion, metrics.Metrics.TLSReloadHooks(purpose))
 }
 
-func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOptions, s *server.ProxyServer) (StopFunc, error) {
+func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOptions, s *server.ProxyServer) (StopFunc, error) {
 	var stop StopFunc
 
 	var tlsConfig *tls.Config
 	var err error
-	if tlsConfig, err = p.getTLSConfig(o.ServerCaCert, o.ServerCert, o.ServerKey, o.CipherSuites, o.TLSMinVersion); err != nil {
+	// ALPN negotiation uses the config returned by GetConfigForClient, which
+	// bypasses the defaults that credentials.NewTLS (h2) and
+	// http.Server.ServeTLS (http/1.1) apply only to the config they are handed
+	// at startup, so each mode advertises its protocol explicitly.
+	nextProtos := []string{"http/1.1"}
+	if o.Mode == "grpc" {
+		nextProtos = []string{"h2"}
+	}
+	if tlsConfig, err = p.getTLSConfig(ctx, o.ServerCaCert, o.ServerCert, o.ServerKey, metrics.TLSPurposeFrontend, nextProtos, o.CipherSuites, o.TLSMinVersion); err != nil {
 		return nil, err
 	}
 
@@ -463,7 +447,7 @@ func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOpti
 			"core", "mtlsGrpcFrontend",
 			"port", strconv.Itoa(o.ServerPort),
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+		go runpprof.Do(ctx, labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = func(_ context.Context) error {
 			grpcServer.GracefulStop()
 			return nil
@@ -486,7 +470,7 @@ func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOpti
 			"core", "mtlsHttpFrontend",
 			"port", strconv.Itoa(o.ServerPort),
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) {
+		go runpprof.Do(ctx, labels, func(context.Context) {
 			err := server.ListenAndServeTLS("", "") // empty files defaults to tlsConfig
 			if err != nil {
 				klog.ErrorS(err, "failed to listen on frontend port")
@@ -497,10 +481,10 @@ func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOpti
 	return stop, nil
 }
 
-func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyServer) error {
+func (p *Proxy) runAgentServer(ctx context.Context, o *options.ProxyRunOptions, server *server.ProxyServer) error {
 	var tlsConfig *tls.Config
 	var err error
-	if tlsConfig, err = p.getTLSConfig(o.ClusterCaCert, o.ClusterCert, o.ClusterKey, o.CipherSuites, o.TLSMinVersion); err != nil {
+	if tlsConfig, err = p.getTLSConfig(ctx, o.ClusterCaCert, o.ClusterCert, o.ClusterKey, metrics.TLSPurposeCluster, []string{"h2"}, o.CipherSuites, o.TLSMinVersion); err != nil {
 		return err
 	}
 
@@ -523,7 +507,7 @@ func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyS
 		"core", "agentListener",
 		"port", strconv.Itoa(o.AgentPort),
 	)
-	go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+	go runpprof.Do(ctx, labels, func(context.Context) { grpcServer.Serve(lis) })
 	p.agentServer = grpcServer
 
 	return nil
