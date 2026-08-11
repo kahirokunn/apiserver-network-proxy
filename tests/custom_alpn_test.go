@@ -28,7 +28,6 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 )
@@ -62,13 +61,13 @@ func TestCustomALPN(t *testing.T) {
 	}
 	ca.Close()
 
-	tlsConfig, err := util.GetClientTLSConfig(ca.Name(), "", "", "", []string{proto})
+	tlsCredentials, err := util.GetReloadingClientTLSCredentials(t.Context(), ca.Name(), "", "", "", []string{proto}, util.TLSReloadHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	addr := strings.TrimPrefix(svr.URL, "https://")
-	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(tlsCredentials))
 	if err != nil {
 		t.Fatal(err)
 	}
