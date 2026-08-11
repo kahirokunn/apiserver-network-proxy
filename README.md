@@ -94,6 +94,18 @@ make build
 make docker-build
 ```
 
+## Certificate rotation
+
+With `--enable-tls-certificate-reload`, the proxy server and agent reload their TLS certificate, key
+and CA files when they change, without a restart. The files must be regular files or symlinks to them.
+Full TLS handshakes use the reloaded files. If the new files cannot be parsed or the key does not match
+the certificate, the last valid ones stay in use and the reload is retried. Validity dates and key
+usage are not checked, so install a certificate only once it is valid. To rotate a CA, add the new CA
+to the bundle first, then replace the certificates, and remove the old CA last.
+`tls_certificate_reload_failure_total` counts failed reloads, and
+`tls_certificate_last_reload_success_timestamp_seconds` is the time of the last reload that found
+valid files.
+
 ## Examples
 
 The current examples run two actual services as well as a sample client on one end and a sample destination for
