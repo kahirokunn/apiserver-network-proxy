@@ -24,6 +24,7 @@ import (
 
 	commonmetrics "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 )
 
 type Direction string
@@ -50,17 +51,19 @@ var (
 
 // AgentMetrics includes all the metrics of the proxy agent.
 type AgentMetrics struct {
-	dialLatencies       *prometheus.HistogramVec
-	serverFailures      *prometheus.CounterVec
-	dialFailures        *prometheus.CounterVec
-	serverConnections   *prometheus.GaugeVec
-	serverCount         prometheus.Gauge
-	endpointConnections *prometheus.GaugeVec
-	streamPackets       *prometheus.CounterVec
-	streamErrors        *prometheus.CounterVec
-	leaseLists          *prometheus.CounterVec
-	leaseWatches        *prometheus.CounterVec
-	leaseListLatencies  *prometheus.HistogramVec
+	dialLatencies        *prometheus.HistogramVec
+	serverFailures       *prometheus.CounterVec
+	dialFailures         *prometheus.CounterVec
+	serverConnections    *prometheus.GaugeVec
+	serverCount          prometheus.Gauge
+	endpointConnections  *prometheus.GaugeVec
+	streamPackets        *prometheus.CounterVec
+	streamErrors         *prometheus.CounterVec
+	leaseLists           *prometheus.CounterVec
+	leaseWatches         *prometheus.CounterVec
+	leaseListLatencies   *prometheus.HistogramVec
+	tlsReloadFailures    prometheus.Counter
+	tlsReloadLastSuccess prometheus.Gauge
 }
 
 // newAgentMetrics create a new AgentMetrics, configured with default metric names.
@@ -147,8 +150,26 @@ func newAgentMetrics() *AgentMetrics {
 		},
 		[]string{"http_response_code"},
 	)
+	tlsReloadFailures := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "tls_certificate_reload_failure_total",
+			Help:      "Count of failed TLS certificate reload attempts.",
+		},
+	)
+	tlsReloadLastSuccess := prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "tls_certificate_last_reload_success_timestamp_seconds",
+			Help:      "Unix timestamp of the last TLS certificate reload attempt that confirmed valid files, including attempts that found them unchanged.",
+		},
+	)
 	streamPackets := commonmetrics.MakeStreamPacketsTotalMetric(Namespace, Subsystem)
 	streamErrors := commonmetrics.MakeStreamErrorsTotalMetric(Namespace, Subsystem)
+	prometheus.MustRegister(tlsReloadFailures)
+	prometheus.MustRegister(tlsReloadLastSuccess)
 	prometheus.MustRegister(dialLatencies)
 	prometheus.MustRegister(serverFailures)
 	prometheus.MustRegister(dialFailures)
@@ -161,17 +182,19 @@ func newAgentMetrics() *AgentMetrics {
 	prometheus.MustRegister(leaseWatches)
 	prometheus.MustRegister(leaseListLatencies)
 	return &AgentMetrics{
-		dialLatencies:       dialLatencies,
-		serverFailures:      serverFailures,
-		dialFailures:        dialFailures,
-		serverConnections:   serverConnections,
-		endpointConnections: endpointConnections,
-		streamPackets:       streamPackets,
-		streamErrors:        streamErrors,
-		serverCount:         serverCount,
-		leaseLists:          leaseLists,
-		leaseWatches:        leaseWatches,
-		leaseListLatencies:  leaseListLatencies,
+		dialLatencies:        dialLatencies,
+		serverFailures:       serverFailures,
+		dialFailures:         dialFailures,
+		serverConnections:    serverConnections,
+		endpointConnections:  endpointConnections,
+		streamPackets:        streamPackets,
+		streamErrors:         streamErrors,
+		serverCount:          serverCount,
+		leaseLists:           leaseLists,
+		leaseWatches:         leaseWatches,
+		leaseListLatencies:   leaseListLatencies,
+		tlsReloadFailures:    tlsReloadFailures,
+		tlsReloadLastSuccess: tlsReloadLastSuccess,
 	}
 
 }
@@ -186,6 +209,15 @@ func (a *AgentMetrics) Reset() {
 	a.streamPackets.Reset()
 	a.streamErrors.Reset()
 	a.leaseLists.Reset()
+}
+
+// TLSReloadHooks returns reload callbacks that record the TLS certificate
+// reload metrics of the agent.
+func (a *AgentMetrics) TLSReloadHooks() util.TLSReloadHooks {
+	return util.TLSReloadHooks{
+		OnSuccess: a.tlsReloadLastSuccess.SetToCurrentTime,
+		OnFailure: a.tlsReloadFailures.Inc,
+	}
 }
 
 // ObserveServerFailure records a failure to send to or receive from the proxy

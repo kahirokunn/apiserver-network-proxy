@@ -27,3 +27,12 @@ the correct number of connections on their metrics endpoints.
 Similar to `static_count_test.go`, except using the new lease-based server counting
 system rather than passing the server count to the KNP server deployment as a CLI
 flag.
+
+### `tls_rotation_test.go`
+
+Deploys two proxy servers and one agent with TLS material from Kubernetes Secrets,
+then rotates the servers' serving certificates by updating those Secrets. The test
+verifies that the new certificates are served through the projected volumes without
+any pod restarting. The semantics of a full staged CA rotation are covered by the
+in-process integration test in `tests/tls_rotation_test.go`, which does not depend
+on a kind cluster.

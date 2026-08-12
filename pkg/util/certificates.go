@@ -20,29 +20,28 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"os"
-	"path/filepath"
+
+	certutil "k8s.io/client-go/util/cert"
 )
 
-// getCACertPool loads CA certificates to pool
-func getCACertPool(caFile string) (*x509.CertPool, error) {
-	certPool := x509.NewCertPool()
-	caCert, err := os.ReadFile(filepath.Clean(caFile))
+// newCACertPool parses caCert as a bundle of PEM-encoded certificates. A
+// CERTIFICATE block that does not parse as a certificate rejects the whole
+// bundle instead of being skipped. Data that does not form a valid PEM block
+// is ignored by the underlying parser, the same behavior as kube-apiserver's
+// dynamic CA reload.
+func newCACertPool(caCert []byte) (*x509.CertPool, error) {
+	certPool, err := certutil.NewPoolFromBytes(caCert)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read CA cert %s: %v", caFile, err)
-	}
-	ok := certPool.AppendCertsFromPEM(caCert)
-	if !ok {
-		return nil, fmt.Errorf("failed to append CA cert to the cert pool")
+		return nil, fmt.Errorf("failed to parse CA certificate bundle: %w", err)
 	}
 	return certPool, nil
 }
 
-// GetClientTLSConfig returns tlsConfig based on x509 certs
+// GetClientTLSConfig returns tlsConfig based on x509 certs.
 func GetClientTLSConfig(caFile, certFile, keyFile, serverName string, protos []string) (*tls.Config, error) {
-	certPool, err := getCACertPool(caFile)
+	certPool, err := certutil.NewPool(caFile)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to load CA cert %s: %w", caFile, err)
 	}
 
 	tlsConfig := &tls.Config{
@@ -53,13 +52,13 @@ func GetClientTLSConfig(caFile, certFile, keyFile, serverName string, protos []s
 		tlsConfig.NextProtos = protos
 	}
 	if certFile == "" && keyFile == "" {
-		// return TLS config based on CA only
+		// Return TLS config based on CA only.
 		return tlsConfig, nil
 	}
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load X509 key pair %s and %s: %v", certFile, keyFile, err)
+		return nil, fmt.Errorf("failed to load X509 key pair %s and %s: %w", certFile, keyFile, err)
 	}
 
 	tlsConfig.ServerName = serverName
