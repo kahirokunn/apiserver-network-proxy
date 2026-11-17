@@ -41,6 +41,10 @@ type ProxyServerOpts struct {
 	AgentPort   int // Defaults to random port.
 	// Nil keeps the server default; a pointer to zero disables the writer queue.
 	FrontendWriteChannelSize *int
+	// CertsDir holds the cluster (agent-facing) certificates, and defaults to
+	// the shared CertsDir. Tests that rewrite certificates must set it to a
+	// private directory so they do not disturb other tests.
+	CertsDir string
 }
 
 type ProxyServerRunner interface {
@@ -150,12 +154,17 @@ func serverOptions(t testing.TB, opts ProxyServerOpts) (*serveropts.ProxyRunOpti
 	}
 
 	uid := uuid.New().String()
+	// Keep sockets outside the TLS directory so socket churn cannot trigger reloads.
 	o.UdsName = filepath.Join(CertsDir, fmt.Sprintf("server-%s.sock", uid))
 	o.ServerPort = 0 // Required for UDS
 
-	o.ClusterCert = filepath.Join(CertsDir, TestServerCertFile)
-	o.ClusterKey = filepath.Join(CertsDir, TestServerKeyFile)
-	o.ClusterCaCert = filepath.Join(CertsDir, TestCAFile)
+	certsDir := opts.CertsDir
+	if certsDir == "" {
+		certsDir = CertsDir
+	}
+	o.ClusterCert = filepath.Join(certsDir, TestServerCertFile)
+	o.ClusterKey = filepath.Join(certsDir, TestServerKeyFile)
+	o.ClusterCaCert = filepath.Join(certsDir, TestCAFile)
 
 	const localhost = "127.0.0.1"
 	o.AgentBindAddress = localhost
