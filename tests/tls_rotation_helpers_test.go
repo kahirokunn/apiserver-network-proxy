@@ -22,6 +22,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,6 +31,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	certutil "k8s.io/client-go/util/cert"
+	"k8s.io/klog/v2"
 )
 
 const rotationServerHost = "127.0.0.1"
@@ -47,6 +50,66 @@ func waitFor(t *testing.T, description string, condition func() error) {
 	if err != nil {
 		t.Fatalf("Timed out waiting for %s: %v", description, lastErr)
 	}
+}
+
+// assertTunnelAlive sends a message through an already established tunnel
+// connection and waits for the echo backend to send it back.
+func assertTunnelAlive(t *testing.T, conn net.Conn, stage string) {
+	t.Helper()
+	sent := []byte(fmt.Sprintf("tunnel is alive %s", stage))
+	received := make([]byte, len(sent))
+
+	// Tunnel connections do not implement SetDeadline (it always returns "not
+	// implemented"), so the round trip runs on its own goroutine and is bounded
+	// by a timer. Closing the connection is what releases that goroutine.
+	done := make(chan error, 1)
+	go func() {
+		if _, err := conn.Write(sent); err != nil {
+			done <- fmt.Errorf("write failed: %w", err)
+			return
+		}
+		if _, err := io.ReadFull(conn, received); err != nil {
+			done <- fmt.Errorf("read failed: %w", err)
+			return
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Tunnel connection broken %s: %v", stage, err)
+		}
+		if !bytes.Equal(received, sent) {
+			t.Fatalf("Tunnel connection returned %q %s, want %q", received, stage, sent)
+		}
+	case <-time.After(10 * time.Second):
+		conn.Close()
+		t.Fatalf("Timed out on the tunnel round trip %s", stage)
+	}
+}
+
+// startEchoBackend runs a TCP echo server for the rest of the test and returns
+// the address to dial it on.
+func startEchoBackend(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				klog.Info(err)
+				return
+			}
+			go echo(conn)
+		}
+	}()
+	return ln.Addr().String()
 }
 
 // rotationProbe handshakes with the agent-facing listener directly, which is
