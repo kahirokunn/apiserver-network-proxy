@@ -94,6 +94,13 @@ make build
 make docker-build
 ```
 
+## Certificate rotation
+
+The agent reloads its TLS certificate, key and CA files when they change, without a restart. New
+handshakes use the reloaded files. If the new files are invalid, the last valid ones stay in use and
+the reload is retried. The `tls_certificate_reload_failure_total` and
+`tls_certificate_last_reload_success_timestamp_seconds` metrics report reload failures.
+
 ## Examples
 
 The current examples run two actual services as well as a sample client on one end and a sample destination for
