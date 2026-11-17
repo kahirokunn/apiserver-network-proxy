@@ -96,16 +96,24 @@ make docker-build
 
 ## Certificate rotation
 
-The agent watches `--ca-cert`, `--agent-cert` and `--agent-key` and reloads them without a restart.
+The proxy server and agent watch their configured TLS files and reload them without a restart.
 The certificate, private key and CA bundle are validated together. New handshakes use the latest valid
 material; established connections keep their existing TLS session. An incomplete or invalid update
 keeps the last valid material active while the reload is retried. CA bundle parsing uses the same
 client-go parser as startup validation.
 
+| Component | TLS files | Server metric purpose |
+| --- | --- | --- |
+| Agent | `--ca-cert`, `--agent-cert`, `--agent-key` | Not applicable |
+| Server frontend listener | `--server-ca-cert`, `--server-cert`, `--server-key` | `frontend` |
+| Server agent listener | `--cluster-ca-cert`, `--cluster-cert`, `--cluster-key` | `cluster` |
+
 The metrics endpoint reports reload health:
 
 - `konnectivity_network_proxy_agent_tls_certificate_reload_failure_total`: failed reload attempts.
 - `konnectivity_network_proxy_agent_tls_certificate_last_reload_success_timestamp_seconds`: last attempt that confirmed valid files, including unchanged files.
+- `konnectivity_network_proxy_server_tls_certificate_reload_failure_total`: failed reload attempts, labeled by `purpose`.
+- `konnectivity_network_proxy_server_tls_certificate_last_reload_success_timestamp_seconds`: last attempt that confirmed valid files, labeled by `purpose`.
 
 A non-atomic certificate and key update can briefly fail validation until both files are present.
 Individual failures can therefore be transient; a stale success timestamp indicates that valid

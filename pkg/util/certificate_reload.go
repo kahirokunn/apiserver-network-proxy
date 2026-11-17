@@ -54,6 +54,69 @@ type TLSReloadHooks struct {
 	OnFailure func()
 }
 
+// GetReloadingServerTLSConfig validates the configured files and returns a
+// server TLS config whose identity and trust material are refreshed
+// asynchronously. New handshakes use the latest valid material.
+func GetReloadingServerTLSConfig(ctx context.Context, caFile, certFile, keyFile string, nextProtos []string, cipherSuites []uint16, minVersion uint16, hooks TLSReloadHooks) (*tls.Config, error) {
+	reloader, err := newServerTLSConfigReloader(caFile, certFile, keyFile, nextProtos, cipherSuites, minVersion, hooks)
+	if err != nil {
+		return nil, err
+	}
+	reloader.material.start(ctx)
+	return reloader.tlsConfig(), nil
+}
+
+type serverTLSConfigReloader struct {
+	material     *tlsMaterialReloader
+	nextProtos   []string
+	cipherSuites []uint16
+	minVersion   uint16
+}
+
+func newServerTLSConfigReloader(caFile, certFile, keyFile string, nextProtos []string, cipherSuites []uint16, minVersion uint16, hooks TLSReloadHooks) (*serverTLSConfigReloader, error) {
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf("server certificate and key files must be configured")
+	}
+	material, err := newTLSMaterialReloader(caFile, certFile, keyFile, hooks)
+	if err != nil {
+		return nil, err
+	}
+	return &serverTLSConfigReloader{
+		material:     material,
+		nextProtos:   append([]string(nil), nextProtos...),
+		cipherSuites: append([]uint16(nil), cipherSuites...),
+		minVersion:   minVersion,
+	}, nil
+}
+
+func (r *serverTLSConfigReloader) currentTLSConfig() *tls.Config {
+	material := r.material.current.Load()
+
+	// The reloader owns nextProtos and cipherSuites, and crypto/tls treats the
+	// returned config as read-only, so both slices can be shared. Session
+	// ticket keys come from the listener's config rather than the one returned
+	// here, so session resumption survives generation changes.
+	config := &tls.Config{ // #nosec G402 -- the caller supplies the minimum version.
+		Certificates: []tls.Certificate{*material.certificate},
+		NextProtos:   r.nextProtos,
+		MinVersion:   r.minVersion,
+		CipherSuites: r.cipherSuites,
+	}
+	if r.material.caFile != "" {
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+		config.ClientCAs = material.caPool
+	}
+	return config
+}
+
+func (r *serverTLSConfigReloader) tlsConfig() *tls.Config {
+	config := r.currentTLSConfig().Clone()
+	config.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		return r.currentTLSConfig(), nil
+	}
+	return config
+}
+
 // tlsMaterial is one published generation of validated TLS material. It also
 // carries the PEM it was parsed from, so that a reload can detect that the
 // files are unchanged without parsing them again.
